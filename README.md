@@ -70,6 +70,22 @@ python check_email.py --account work personal --days 7
 ```
 处理多个用户最近 7 天的邮件 / check the last 7 days of many users
 
+## 可选设置 / Optional settings (.env)
+
+- `BOMB_THRESHOLD`（默认 30）、`BOMB_WINDOW_MIN`（默认 60）：`BOMB_WINDOW_MIN` 分钟内陌生邮件超过 `BOMB_THRESHOLD` 封才算轰炸
+
+  `BOMB_THRESHOLD` (default 30), `BOMB_WINDOW_MIN` (default 60): only more than `BOMB_THRESHOLD` strangers inside `BOMB_WINDOW_MIN` minutes counts as bombing
+
+- `AI_DELAY`（默认 4）：两次 AI 调用间隔秒数 / seconds between AI calls
+
+## 测试 / Tests
+
+离线测试，用假的 Gmail 和假的 AI，不需要账号或 Key / offline tests with a fake Gmail and fake AI, no account or key needed:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## 注意 firendly remind:
 
 - 免费版 Gemini API 的内容可能被用于改进 Google 产品，请勿处理敏感邮件
