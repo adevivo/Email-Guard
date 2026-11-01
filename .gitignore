@@ -9,3 +9,13 @@ venv/
 # Python
 __pycache__/
 *.pyc
+
+# private files
+guard_log.csv
+known_contacts.json
+token_personal.json
+token_work.json
+known_contacts_work.json
+known_contacts_personal.json
+guard_log_personal.csv
+guard_log_work.csv
