@@ -7,12 +7,14 @@ Email Guard — a tiny AI bouncer for emails from strangers 🚪
      Friends list (people you've emailed + whitelist.txt) walk right in. No AI needed.
   2. 验证码 / noreply 自动邮件：打标签、移出收件箱，不过 AI
      Verification codes / noreply robots: labeled and shoved out of the inbox, no AI needed.
-  3. 陌生邮件超过 BOMB_THRESHOLD 封：判定为被轰炸，整批进待审，不逐封调 AI
-     Too many strangers at once = you're being bombed. Whole batch goes to review, AI wallet stays closed.
+  3. BOMB_WINDOW_MIN 分钟内陌生邮件超过 BOMB_THRESHOLD 封：判定为被轰炸，这一波进待审，不逐封调 AI
+     More than BOMB_THRESHOLD strangers inside BOMB_WINDOW_MIN minutes = you're being bombed.
+     That burst goes to review, AI wallet stays closed. Strangers outside the burst still get checked.
   4. 其余陌生邮件交给 AI 三分类：辱骂 / 阴阳怪气 / 正常
      The remaining strangers get a 3-way verdict from the AI: insulting / sarcastic / normal.
-  5. 只打标签、移出收件箱，绝不删除（权限也只有 gmail.modify）
-     Labels only, NEVER deletes (the permission is only gmail.modify, it physically can't).
+  5. 只打标签、移出收件箱，绝不删除（代码从不调用删除 / 移到垃圾箱）
+     Labels only, NEVER deletes. The code never calls delete or trash. (Note: the gmail.modify
+     scope *could* move mail to Trash, it just isn't used that way. Permanent delete needs a wider scope.)
 
 AI 接口是 OpenAI 兼容格式：Gemini / OpenAI / DeepSeek / Ollama 本地模型都能用，改 .env 就行
 The AI side speaks the OpenAI-compatible format: Gemini / OpenAI / DeepSeek / local Ollama all work, just edit .env.
@@ -26,6 +28,7 @@ The AI side speaks the OpenAI-compatible format: Gemini / OpenAI / DeepSeek / lo
 
 import argparse
 import base64
+import codecs
 import csv
 import html
 import json
@@ -43,6 +46,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from openai import OpenAI
 
 try:  # Windows 终端有时不是 UTF-8，避免打印中文 / emoji 时报错
@@ -67,7 +71,8 @@ BASE_URL = os.getenv(
 )
 MODEL = os.getenv("LLM_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite"
 
-BOMB_THRESHOLD = 30      # 一批陌生邮件超过这个数 = 被轰炸 / more strangers than this = bombing
+BOMB_THRESHOLD = int(os.getenv("BOMB_THRESHOLD", "30"))  # 时间窗口内陌生邮件超过这个数 = 被轰炸 / more strangers than this inside the window = bombing
+BOMB_WINDOW_MIN = int(os.getenv("BOMB_WINDOW_MIN", "60"))  # 轰炸检测的时间窗口（分钟） / bombing detection window (minutes)
 BODY_CHARS = 500         # 只给 AI 看正文前 500 字（省钱，也防超长文攻击） / AI only reads the first 500 chars: cheaper, and long-text attacks bounce off
 AI_DELAY = float(os.getenv("AI_DELAY", "4"))  # 两次 AI 调用间隔秒数（免费档限速） / seconds between AI calls (free tiers are shy)
 MAX_SENT_SCAN = 500      # 最多扫描多少封已发邮件来建熟人名单 / how many sent mails to scan for the friends list
@@ -106,8 +111,8 @@ AUTO_SENDER = re.compile(
 )
 AUTO_SUBJECT = re.compile(
     r"验证码|校验码|动态码|verification code|verify your|one[- ]time (code|password)|\botp\b"
-    r"|welcome to|欢迎(加入|注册|使用)|confirm your (email|account|subscription)"
-    r"|activate your|激活(你的|您的|账号|账户)|reset your password|重置密码|订阅",
+    r"|confirm your (email|account|subscription)"
+    r"|activate your|激活(你的|您的|账号|账户)|reset your password|重置密码",
     re.I,
 )
 
@@ -251,7 +256,10 @@ def load_manual_whitelist():
 def is_known(addr, contacts, manual_addrs, manual_domains):
     if addr in contacts or addr in manual_addrs:
         return True
-    return "@" + addr.split("@")[-1] in manual_domains
+    # @example.com 也覆盖 mail.example.com / @example.com also covers subdomains like mail.example.com
+    domain = addr.split("@")[-1]
+    parts = domain.split(".")
+    return any("@" + ".".join(parts[i:]) in manual_domains for i in range(len(parts) - 1))
 
 
 # ---------------- 读邮件 / Reading mail ----------------
@@ -262,6 +270,27 @@ def header_map(msg):
     }
 
 
+CHARSET_RE = re.compile(r'charset\s*=\s*"?([\w.:-]+)', re.I)
+
+
+def part_charset(part):
+    """Gmail API 返回的是原始字节，没有转成 UTF-8：要按 Content-Type 里的 charset 解码。
+    The Gmail API hands back the raw bytes in the sender's charset (GBK, Big5, ...), not UTF-8."""
+    for h in part.get("headers", []) or []:
+        if h.get("name", "").lower() == "content-type":
+            m = CHARSET_RE.search(h.get("value", ""))
+            if m:
+                cs = m.group(1).lower()
+                if cs in ("gb2312", "gbk", "x-gbk", "cp936"):
+                    cs = "gb18030"  # GB18030 是 GBK/GB2312 的超集 / superset of GBK/GB2312
+                try:
+                    codecs.lookup(cs)
+                    return cs
+                except LookupError:
+                    pass
+    return "utf-8"
+
+
 def extract_text(payload):
     plain, rich = [], []
 
@@ -270,7 +299,7 @@ def extract_text(payload):
         data = part.get("body", {}).get("data")
         if data and mime in ("text/plain", "text/html"):
             raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-            text = raw.decode("utf-8", errors="replace")
+            text = raw.decode(part_charset(part), errors="replace")
             (plain if mime == "text/plain" else rich).append(text)
         for sub in part.get("parts", []) or []:
             walk(sub)
@@ -296,7 +325,7 @@ def classify(client, sender, subject, body):
     Returns ABUSE / SARCASM / NORMAL / UNKNOWN; returns None on network-type failures (retry next run)."""
 
     def clean(s):
-        return s.replace("<email>", "").replace("</email>", "")
+        return re.sub(r"<\s*/?\s*email\s*>", "", s, flags=re.I)
 
     user_msg = (
         "<email>\n"
@@ -340,11 +369,33 @@ def classify(client, sender, subject, body):
 
 # ---------------- 动作 / Actions ----------------
 def modify(svc, mid, add, remove):
+    """成功返回 True；Gmail 报错返回 False（没打上 AI已检查，下次会重试）。
+    Returns True on success; False on a Gmail error (no AI-Checked label, so it's retried next run)."""
     add = [x for x in add if x]
     remove = [x for x in remove if x]
-    svc.users().messages().modify(
-        userId="me", id=mid, body={"addLabelIds": add, "removeLabelIds": remove}
-    ).execute()
+    try:
+        svc.users().messages().modify(
+            userId="me", id=mid, body={"addLabelIds": add, "removeLabelIds": remove}
+        ).execute()
+        return True
+    except HttpError as e:
+        print(f"  Gmail 改标签失败 Gmail modify failed ({mid}): {str(e)[:200]}")
+        return False
+
+
+def find_bursts(strangers, threshold, window_s):
+    """找出"轰炸"：任意 window_s 秒内陌生邮件超过 threshold 封，这些邮件都算轰炸。
+    Find bombing bursts: any window_s-second stretch holding more than threshold strangers.
+    strangers 是 (mid, ts_seconds, ...) 元组；返回属于轰炸的 mid 集合。
+    strangers are (mid, ts_seconds, ...) tuples; returns the set of mids inside a burst."""
+    items = sorted((s[1], s[0]) for s in strangers)
+    burst, left = set(), 0
+    for right in range(len(items)):
+        while items[right][0] - items[left][0] > window_s:
+            left += 1
+        if right - left + 1 > threshold:
+            burst.update(mid for _, mid in items[left : right + 1])
+    return burst
 
 
 def log_row(writer, mode, addr, subject, verdict):
@@ -429,7 +480,8 @@ def process_account(account, dry, days, client):
         if AUTO_SENDER.search(addr) or AUTO_SUBJECT.search(subject):
             auto.append((mid, addr, subject))
         else:
-            strangers.append((mid, name, addr, subject))
+            ts = int(msg.get("internalDate", 0)) / 1000
+            strangers.append((mid, ts, name, addr, subject))
 
     print(
         f"收件箱 inbox {len(ids)} 封｜熟人放行 friends {skipped}｜自动邮件 robots {len(auto)}｜陌生人 strangers {len(strangers)}"
@@ -449,25 +501,34 @@ def process_account(account, dry, days, client):
         # 3. 自动邮件 / Robot mail
         for mid, addr, subject in auto:
             print(f"[{DISPLAY[AUTO]}] {addr} | {subject[:40]}")
-            if not dry:
-                modify(svc, mid, [L["auto"], L["checked"]], ["INBOX"])
+            if not dry and not modify(svc, mid, [L["auto"], L["checked"]], ["INBOX"]):
+                continue
             log_row(writer, mode, addr, subject, AUTO)
             stats[AUTO] += 1
 
-        # 4. 被轰炸：整批进待审 / Under bombing: the whole batch goes to review
-        if len(strangers) > BOMB_THRESHOLD:
-            print(f"⚠️ 陌生邮件多达 {len(strangers)} COUNTLESS suspect emails found, 疑似被轰炸：不逐封调用 AI，整批进『{LABELS['bulk']}』←you need to automatic check them manually")
-            for mid, name, addr, subject in strangers:
-                if not dry:
-                    modify(svc, mid, [L["bulk"], L["checked"]], ["INBOX"])
+        # 4. 被轰炸：这一波进待审 / Under bombing: the burst goes to review
+        #    只看短时间内的爆发，不看总数：否则平时的推广/订阅邮件攒够 30 封就会误触发
+        #    Look for a burst in a short window, not the total, or a normal week of newsletters trips it.
+        burst = find_bursts(strangers, BOMB_THRESHOLD, BOMB_WINDOW_MIN * 60)
+        if burst:
+            print(f"⚠️ {BOMB_WINDOW_MIN} 分钟内陌生邮件多达 {len(burst)} 封，疑似被轰炸：不逐封调用 AI，这一波进『{LABELS['bulk']}』，请手动检查 / {len(burst)} strangers within {BOMB_WINDOW_MIN} min, looks like bombing: skipping AI, the burst goes to 『{LABELS['bulk']}』 for manual review")
+            for mid, ts, name, addr, subject in strangers:
+                if mid not in burst:
+                    continue
+                if not dry and not modify(svc, mid, [L["bulk"], L["checked"]], ["INBOX"]):
+                    continue
                 log_row(writer, mode, addr, subject, BULK)
                 stats[BULK] += 1
-            strangers = []
+            strangers = [s for s in strangers if s[0] not in burst]
 
         # 5. 逐封 AI 分类 / Classify one by one
         failures = 0
-        for mid, name, addr, subject in strangers:
-            full = svc.users().messages().get(userId="me", id=mid, format="full").execute()
+        for mid, ts, name, addr, subject in strangers:
+            try:
+                full = svc.users().messages().get(userId="me", id=mid, format="full").execute()
+            except HttpError as e:
+                print(f"  读取邮件失败 couldn't fetch {mid}: {str(e)[:200]}")
+                continue
             body = extract_text(full.get("payload", {})) or full.get("snippet", "")
             try:
                 verdict = classify(client, f"{name} <{addr}>", subject, body)
@@ -486,11 +547,14 @@ def process_account(account, dry, days, client):
             print(f"[{DISPLAY[verdict]}] {addr} | {subject[:40]}")
             if not dry:
                 if verdict == ABUSE:
-                    modify(svc, mid, [L["abuse"], L["checked"]], ["INBOX", "UNREAD"])
+                    ok = modify(svc, mid, [L["abuse"], L["checked"]], ["INBOX", "UNREAD"])
                 elif verdict in (SARCASM, UNKNOWN):
-                    modify(svc, mid, [L["sarcasm"], L["checked"]], ["INBOX"])
+                    ok = modify(svc, mid, [L["sarcasm"], L["checked"]], ["INBOX"])
                 else:
-                    modify(svc, mid, [L["checked"]], [])
+                    ok = modify(svc, mid, [L["checked"]], [])
+                if not ok:
+                    time.sleep(AI_DELAY)
+                    continue
             log_row(writer, mode, addr, subject, verdict)
             stats[verdict] += 1
             time.sleep(AI_DELAY)
