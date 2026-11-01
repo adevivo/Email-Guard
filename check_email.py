@@ -7,6 +7,9 @@ Email Guard — a tiny AI bouncer for emails from strangers 🚪
      Friends list (people you've emailed + whitelist.txt) walk right in. No AI needed.
   2. 验证码 / noreply 自动邮件：打标签、移出收件箱，不过 AI
      Verification codes / noreply robots: labeled and shoved out of the inbox, no AI needed.
+     订阅邮件 / 推广（有退订头且通过 DMARC，或 Gmail 归到推广/社交/论坛）：留在收件箱，不过 AI
+     Newsletters / promos (unsubscribe header + DMARC pass, or Gmail's Promotions/Social/Forums tab):
+     left alone in the inbox, no AI needed.
   3. BOMB_WINDOW_MIN 分钟内陌生邮件超过 BOMB_THRESHOLD 封：判定为被轰炸，这一波进待审，不逐封调 AI
      More than BOMB_THRESHOLD strangers inside BOMB_WINDOW_MIN minutes = you're being bombed.
      That burst goes to review, AI wallet stays closed. Strangers outside the burst still get checked.
@@ -115,6 +118,21 @@ AUTO_SUBJECT = re.compile(
     r"|activate your|激活(你的|您的|账号|账户)|reset your password|重置密码",
     re.I,
 )
+
+# 发件人能随便写的头（List-Unsubscribe 等）只在 Gmail 验证通过 DMARC 时才信：
+# 否则骚扰者自己加个退订头就能绕过 AI。Gmail 2024 起要求批量发件人必须有 DMARC + 一键退订。
+# Senders can write any header they like, so list headers only count when Gmail says DMARC passed.
+# Otherwise a harasser could add List-Unsubscribe and skip the AI. Since 2024 Gmail requires
+# bulk senders to have DMARC and one-click unsubscribe, so real newsletters pass this.
+LIST_HEADERS = ("list-unsubscribe", "list-id")
+BULK_PRECEDENCE = ("bulk", "list", "junk")
+# Gmail 自己的分类标签，发件人改不了 / Gmail's own tab labels; the sender can't set these
+LIST_CATEGORIES = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
+DMARC_PASS_RE = re.compile(r"\bdmarc=pass\b", re.I)
+META_HEADERS = [
+    "From", "Subject", "List-Unsubscribe", "List-Id", "Precedence",
+    "Auto-Submitted", "Authentication-Results",
+]
 
 SYSTEM_PROMPT = """你是邮件分类器 / You are an email classifier.
 任务 / Job: put exactly ONE label on an email sent by a stranger.
@@ -268,6 +286,39 @@ def header_map(msg):
         h["name"].lower(): h["value"]
         for h in msg.get("payload", {}).get("headers", [])
     }
+
+
+def gmail_dmarc_pass(msg):
+    """只看最上面那条 Authentication-Results（Gmail 收信时加的）；发件人伪造的会在它下面。
+    Only trust the topmost Authentication-Results, the one Gmail added on arrival.
+    Any the sender forged sit below it."""
+    for h in msg.get("payload", {}).get("headers", []):
+        if h["name"].lower() == "authentication-results":
+            value = h["value"].strip()
+            return value.lower().startswith("mx.google.com") and bool(DMARC_PASS_RE.search(value))
+    return False
+
+
+def is_auto(addr, subject, h):
+    """验证码 / 系统通知这类机器邮件。伪造也没用：只会被移出收件箱。
+    Robot mail like codes and system notices. Faking it gains nothing: the mail just gets archived."""
+    auto_submitted = h.get("auto-submitted", "").strip().lower()
+    return bool(
+        AUTO_SENDER.search(addr)
+        or AUTO_SUBJECT.search(subject)
+        or (auto_submitted and auto_submitted != "no")  # RFC 3834
+    )
+
+
+def is_list_mail(msg, h):
+    """订阅 / 推广邮件：不过 AI、不动它。
+    Newsletters / promos: skip the AI and leave them alone."""
+    if LIST_CATEGORIES & set(msg.get("labelIds", [])):
+        return True
+    looks_bulk = any(h.get(k) for k in LIST_HEADERS) or (
+        h.get("precedence", "").strip().lower() in BULK_PRECEDENCE
+    )
+    return looks_bulk and gmail_dmarc_pass(msg)
 
 
 CHARSET_RE = re.compile(r'charset\s*=\s*"?([\w.:-]+)', re.I)
@@ -457,15 +508,15 @@ def process_account(account, dry, days, client):
         if not page:
             break
 
-    # 2. 分流：已检查 / 熟人 / 自动邮件 / 陌生人
-    #    Sorting: already checked / friends / robots / strangers
-    auto, strangers, skipped = [], [], 0
+    # 2. 分流：已检查 / 熟人 / 自动邮件 / 订阅邮件 / 陌生人
+    #    Sorting: already checked / friends / robots / newsletters / strangers
+    auto, strangers, skipped, lists = [], [], 0, 0
     for mid in ids:
         msg = (
             svc.users()
             .messages()
             .get(userId="me", id=mid, format="metadata",
-                 metadataHeaders=["From", "Subject"])
+                 metadataHeaders=META_HEADERS)
             .execute()
         )
         if L["checked"] and L["checked"] in msg.get("labelIds", []):
@@ -477,14 +528,16 @@ def process_account(account, dry, days, client):
         if is_known(addr, contacts, manual_addrs, manual_domains):
             skipped += 1
             continue
-        if AUTO_SENDER.search(addr) or AUTO_SUBJECT.search(subject):
+        if is_auto(addr, subject, h):
             auto.append((mid, addr, subject))
+        elif is_list_mail(msg, h):
+            lists += 1
         else:
             ts = int(msg.get("internalDate", 0)) / 1000
             strangers.append((mid, ts, name, addr, subject))
 
     print(
-        f"收件箱 inbox {len(ids)} 封｜熟人放行 friends {skipped}｜自动邮件 robots {len(auto)}｜陌生人 strangers {len(strangers)}"
+        f"收件箱 inbox {len(ids)} 封｜熟人放行 friends {skipped}｜自动邮件 robots {len(auto)}｜订阅邮件 newsletters {lists}｜陌生人 strangers {len(strangers)}"
         + ("｜【试运行，不会改动邮箱 dry run, mailbox untouched】" if dry else "")
     )
 

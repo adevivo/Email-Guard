@@ -24,6 +24,10 @@ Use Gemini(or other ai) put strange emails into many recycle bins or inbox(insul
 
    Verification codes / noreply robots: labeled and shoved out of the inbox, no AI needed.
 
+   订阅 / 推广邮件（有退订头且 Gmail 验证 DMARC 通过，或 Gmail 归到推广/社交/论坛）：留在收件箱不动，不过 AI
+
+   Newsletters / promos (unsubscribe header + Gmail says DMARC passed, or Gmail put it in Promotions/Social/Forums): left alone in the inbox, no AI needed.
+
 3. 陌生邮件超过 BOMB_THRESHOLD 封：判定为被轰炸，整批进待审，不逐封调 AI
 
    Too many strangers at once = you're being bombed. Whole batch goes to review, AI wallet stays closed.

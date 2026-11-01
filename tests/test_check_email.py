@@ -41,8 +41,15 @@ def b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
 
+GMAIL_AUTH_PASS = "mx.google.com; dkim=pass header.i=@brand.com; spf=pass; dmarc=pass (p=REJECT) header.from=brand.com"
+GMAIL_AUTH_FAIL = "mx.google.com; dkim=none; spf=softfail; dmarc=fail (p=NONE) header.from=brand.com"
+NEWSLETTER = [("List-Unsubscribe", "<https://brand.com/unsub>"), ("Authentication-Results", GMAIL_AUTH_PASS)]
+
+
 def make_msg(mid, sender, subject, body="hello", ts_ms=NOW_MS, charset="utf-8",
-             mime="text/plain", labels=("INBOX", "UNREAD")):
+             mime="text/plain", labels=("INBOX", "UNREAD"), headers=()):
+    # headers 按顺序排在 From/Subject 前面，跟真实邮件一样新加的头在上面
+    # extra headers go first, like real mail where the newest headers are on top
     return {
         "id": mid,
         "labelIds": list(labels),
@@ -50,7 +57,8 @@ def make_msg(mid, sender, subject, body="hello", ts_ms=NOW_MS, charset="utf-8",
         "snippet": body[:50],
         "payload": {
             "mimeType": "multipart/alternative",
-            "headers": [{"name": "From", "value": sender}, {"name": "Subject", "value": subject}],
+            "headers": [{"name": n, "value": v} for n, v in headers]
+            + [{"name": "From", "value": sender}, {"name": "Subject", "value": subject}],
             "parts": [{
                 "mimeType": mime,
                 "headers": [{"name": "Content-Type", "value": f'{mime}; charset="{charset}"'}],
@@ -99,6 +107,11 @@ class FakeGmail:
 
     def get(self, userId, id, format="full", metadataHeaders=None):
         msg = self.msgs.get(id) or next(s for s in self.sent if s["id"] == id)
+        if format == "metadata":
+            # 跟真的 API 一样只返回要求的头 / like the real API, only the requested headers come back
+            wanted = {n.lower() for n in metadataHeaders or []}
+            headers = [h for h in msg["payload"]["headers"] if h["name"].lower() in wanted]
+            msg = {**msg, "payload": {"headers": headers}}
         return _Req(lambda: msg)
 
     def modify(self, userId, id, body):
@@ -239,6 +252,46 @@ class TestRules(unittest.TestCase):
         self.assertEqual(ce.find_bursts(tight[:30], 30, 3600), set())  # 正好等于阈值不算 / exactly threshold is fine
 
 
+class TestHeaderSignals(unittest.TestCase):
+    def check(self, headers=(), labels=("INBOX",)):
+        msg = make_msg("1", "news@brand.com", "Issue 5", headers=headers, labels=labels)
+        return ce.is_list_mail(msg, ce.header_map(msg))
+
+    def test_list_headers_need_dmarc_pass(self):
+        self.assertTrue(self.check(NEWSLETTER))
+        self.assertTrue(self.check([("List-Id", "<news.brand.com>"), ("Authentication-Results", GMAIL_AUTH_PASS)]))
+        self.assertTrue(self.check([("Precedence", "bulk"), ("Authentication-Results", GMAIL_AUTH_PASS)]))
+        # 骚扰者自己加退订头，但没过 DMARC / harasser adds the header but fails DMARC
+        self.assertFalse(self.check([("List-Unsubscribe", "<mailto:x@x.com>")]))
+        self.assertFalse(self.check([("List-Unsubscribe", "<x>"), ("Authentication-Results", GMAIL_AUTH_FAIL)]))
+        # DMARC 通过但不是群发邮件 / DMARC passes but nothing says it's bulk
+        self.assertFalse(self.check([("Authentication-Results", GMAIL_AUTH_PASS)]))
+        self.assertFalse(self.check([("Precedence", "first-class"), ("Authentication-Results", GMAIL_AUTH_PASS)]))
+
+    def test_forged_auth_results_below_gmails_are_ignored(self):
+        forged = [
+            ("Authentication-Results", GMAIL_AUTH_FAIL),   # Gmail 加的，在最上面 / Gmail's, on top
+            ("Authentication-Results", GMAIL_AUTH_PASS),   # 发件人伪造的 / forged by the sender
+            ("List-Unsubscribe", "<x>"),
+        ]
+        self.assertFalse(self.check(forged))
+
+    def test_auth_results_from_other_servers_ignored(self):
+        self.assertFalse(self.check([("Authentication-Results", "evil.example; dmarc=pass"), ("List-Unsubscribe", "<x>")]))
+
+    def test_gmail_categories(self):
+        for cat in ("CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"):
+            self.assertTrue(self.check(labels=("INBOX", cat)), cat)
+        # 更新/个人分类里有账单和真人邮件，照常检查 / Updates & Personal hold receipts and real people: still checked
+        for cat in ("CATEGORY_UPDATES", "CATEGORY_PERSONAL"):
+            self.assertFalse(self.check(labels=("INBOX", cat)), cat)
+
+    def test_auto_submitted(self):
+        for value, expected in (("auto-generated", True), ("auto-replied", True), ("no", False), ("", False)):
+            h = {"auto-submitted": value} if value else {}
+            self.assertEqual(ce.is_auto("someone@x.com", "hello", h), expected, value)
+
+
 class TestClassify(Base):
     def test_email_tags_stripped_case_insensitively(self):
         ai = FakeAI()
@@ -323,6 +376,42 @@ class TestProcessAccount(Base):
             self.assertEqual(g.labels_of(m["id"]), {ce.LABELS["bulk"], ce.LABELS["checked"], "UNREAD"})
         self.assertEqual(len(ai.prompts), 2)  # 轰炸那批没调 AI / the burst never hit the AI
         self.assertIn(ce.LABELS["abuse"], g.labels_of("c2"))
+
+    def test_newsletters_skip_ai_and_stay_put(self):
+        inbox = [make_msg(f"n{i}", f"news@brand{i}.com", f"Issue {i}", headers=NEWSLETTER,
+                          ts_ms=NOW_MS - i * 4 * HOUR_MS) for i in range(20)]
+        inbox += [make_msg(f"p{i}", f"deals@shop{i}.com", "SALE", labels=("INBOX", "UNREAD", "CATEGORY_PROMOTIONS"))
+                  for i in range(10)]
+        inbox.append(make_msg("real", "client@biz.com", "quote", body="price please"))
+        g = FakeGmail(inbox)
+        ai = FakeAI()
+        self.run_account(g, ai)
+        self.assertEqual(len(ai.prompts), 1)  # 只有真人那封 / only the real person
+        self.assertEqual(g.modify_calls, ["real"])  # 订阅邮件一封都没动 / no newsletter touched
+
+    def test_forged_list_header_still_goes_to_ai(self):
+        g = FakeGmail([make_msg("troll", "troll@x.com", "hey", body="you IDIOT",
+                                headers=[("List-Unsubscribe", "<x>")])])
+        ai = FakeAI()
+        self.run_account(g, ai)
+        self.assertEqual(len(ai.prompts), 1)
+        self.assertIn(ce.LABELS["abuse"], g.labels_of("troll"))
+
+    def test_newsletter_burst_is_not_bombing(self):
+        # 一堆订阅邮件同时到（比如每天早上 8 点）不算轰炸 / newsletters landing together (8am digests) aren't bombing
+        inbox = [make_msg(f"n{i}", f"news@brand{i}.com", "Daily", headers=NEWSLETTER, ts_ms=NOW_MS - i * 1000)
+                 for i in range(40)]
+        g = FakeGmail(inbox)
+        self.run_account(g, FakeAI())
+        self.assertEqual(g.modify_calls, [])
+
+    def test_auto_reply_header_is_robot(self):
+        g = FakeGmail([make_msg("ooo", "Bob <bob@corp.com>", "Re: your message",
+                                headers=[("Auto-Submitted", "auto-replied")])])
+        ai = FakeAI()
+        self.run_account(g, ai)
+        self.assertEqual(ai.prompts, [])
+        self.assertIn(ce.LABELS["auto"], g.labels_of("ooo"))
 
     def test_gmail_error_on_one_message_does_not_stop_run(self):
         g = FakeGmail(self.mixed_inbox(), fail_modify={"abuse"})
