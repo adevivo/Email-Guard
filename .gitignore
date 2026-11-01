@@ -1,0 +1,11 @@
+# key files
+.env
+credentials.json
+token.json
+
+# virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc

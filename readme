@@ -1,0 +1,19 @@
+README.md 骨架
+# Email Guard
+
+用 Gemini 给陌生邮件分类（辱骂 / 阴阳怪气 / 正常），可疑邮件自动打标签隔离。
+
+## 使用方法
+1. `pip install -r requirements.txt`
+2. 复制 `.env.example` 为 `.env`，填入你的 Gemini API Key
+3. 在 Google Cloud 启用 Gmail API，下载 `credentials.json` 放到本目录
+4. 运行 `python check_email.py`，首次会弹浏览器授权
+
+## 注意
+- 本项目只请求 gmail.modify 权限，不会永久删除邮件
+- 免费版 Gemini API 的内容可能被用于改进 Google 产品，请勿处理敏感邮件
+
+## Acknowledgements
+Your input was invalid, but your inspiration was valid. 🫡
+
+致谢位置我给你留好了，具体用哪句你自己挑 😏
